@@ -6,6 +6,10 @@ use std::path::PathBuf;
 pub struct ArduTapeArgs {
     #[clap(subcommand)]
     pub operation: Command,
+
+    /// Serial device to connect to
+    #[clap(short, long)]
+    pub device: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
