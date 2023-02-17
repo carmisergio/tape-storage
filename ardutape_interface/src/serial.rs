@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 // Config constants
 const CONFIG_BAUD_RATE: u32 = 38400;
 const CONFIG_HANDSHAKE_COMMAND: &[u8] = b"H";
-const CONFIG_HANDSHAKE_EXPECTED_RESPONSE: &[u8] = "AT-1.0.0\n".as_bytes();
+const CONFIG_HANDSHAKE_EXPECTED_RESPONSE: &[u8] = "AT-1.0.0".as_bytes();
 const CONFIG_HANDSHAKE_READ_TIMEOUT: u64 = 1000;
 const CONFIG_HANDSHAKE_RETRY_DELAY: u64 = 1000;
 
@@ -43,6 +43,7 @@ pub fn read_n_bytes(
     let mut result_buf: Vec<u8> = vec![];
     let mut read_buf: Vec<u8> = vec![0; 8];
     let mut bytes_read: usize = 0;
+    let mut next_read_size: usize;
 
     // Save start time
     let start_time = Instant::now();
@@ -54,7 +55,14 @@ pub fn read_n_bytes(
             return Err(SerialConnectError::PortReadTimedOut);
         }
 
-        match port.read(read_buf.as_mut_slice()) {
+        // Determine next read size
+        next_read_size = if bytes_to_read - bytes_read <= read_buf.len() {
+            bytes_to_read - bytes_read
+        } else {
+            read_buf.len()
+        };
+
+        match port.read(&mut read_buf[0..next_read_size]) {
             Ok(nbytes) => {
                 result_buf.append(&mut Vec::from(&read_buf[0..nbytes]));
                 bytes_read += nbytes;
@@ -69,7 +77,6 @@ pub fn read_n_bytes(
     Ok(result_buf)
 }
 
-// TODO WAS NOT RETRYING HANDSHAKE
 fn connect_and_handshake(port_name: String) -> Result<Box<dyn SerialPort>, SerialConnectError> {
     let mut port = match open_serial_port(&port_name) {
         Ok(port) => port,
@@ -138,15 +145,11 @@ fn find_and_open() -> Result<Box<dyn SerialPort>, SerialConnectError> {
     };
 
     // Loop over all found ports
-    for port_name in ports {
-        let mut port = match open_serial_port(&port_name.port_name) {
-            Ok(port) => port,
+    for possible_port in ports {
+        match connect_and_handshake(possible_port.port_name) {
+            Ok(port) => return Ok(port),
             Err(_) => continue,
         };
-        match check_connection(&mut port) {
-            Ok(()) => return Ok(port),
-            Err(_) => continue,
-        }
     }
 
     Err(SerialConnectError::NoArduTapeDetected)
