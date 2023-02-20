@@ -4,7 +4,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 // Config constants
-const CONFIG_BAUD_RATE: u32 = 38400;
+const CONFIG_BAUD_RATE: u32 = 9600;
 const CONFIG_HANDSHAKE_COMMAND: &[u8] = b"H";
 const CONFIG_HANDSHAKE_EXPECTED_RESPONSE: &[u8] = "AT-1.0.0".as_bytes();
 const CONFIG_HANDSHAKE_READ_TIMEOUT: u64 = 1000;

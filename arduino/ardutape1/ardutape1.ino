@@ -8,6 +8,7 @@
 #define CMD_HANDSHAKE 'H'
 #define CMD_READ 'R'
 #define CMD_WRITE 'W'
+#define CMD_DATA_REQUEST 'D'
 
 #define BLOCK_SIZE 512
 #define HEADER_LEN 32
@@ -32,8 +33,8 @@ volatile unsigned short bits_to_read;
 volatile bool first_bit;
 
 // Write vars
-volatile bool write_header;
-volatile bool write_buf_1;
+volatile bool writing_header;
+volatile bool writing_buf_1;
 volatile uint32_t blocks_to_write;
 volatile unsigned short bytes_to_write = 0;
 volatile unsigned short byte_to_write_index;
@@ -42,6 +43,7 @@ volatile byte bit_in_byte;
 volatile byte write_phase;
 volatile byte write_end_counter;
 volatile bool write_bit_value;
+volatile byte request_new_data = false;
 
 // Serial vars
 char serial_in;
@@ -91,9 +93,9 @@ ISR(TIMER2_OVF_vect) {
         } else {
           byte_to_write_index++;
           // Get value of next byte
-          if(write_header) {
+          if(writing_header) {
             byte_to_write = header_buf[byte_to_write_index];
-          } else if (write_buf_1) {
+          } else if (writing_buf_1) {
             byte_to_write = rw_buf_1[byte_to_write_index];
           } else {
             byte_to_write = rw_buf_2[byte_to_write_index];
@@ -110,15 +112,16 @@ ISR(TIMER2_OVF_vect) {
 
 void next_buffer() {
   if(blocks_to_write > 0) {
-    write_buf_1 = !write_buf_1;
-    write_header = false;
+    writing_buf_1 = !writing_buf_1;
+    writing_header = false;
+    request_new_data = true; // Tell write loop that new data is needed
     bytes_to_write = RW_BUF_LEN;
     byte_to_write_index = 0;
     bit_in_byte = 7;
     write_phase = 0;
     write_end_counter = 10;
     blocks_to_write--;
-    if(write_buf_1) {
+    if(writing_buf_1) {
       byte_to_write = rw_buf_1[0];
     } else {
       byte_to_write = rw_buf_2[0];
@@ -159,7 +162,8 @@ void start_read(unsigned short length) {
 
 void start_data_write() {
   // Setup to write header
-  write_header = true;
+  writing_header = true;
+  writing_buf_1 = false;
   bytes_to_write = HEADER_BUF_LEN;
   byte_to_write_index = 0;
   bit_in_byte = 7;
@@ -195,15 +199,56 @@ void set_header(uint32_t &file_length) {
   debugSerial.println();
 }
 
+bool read_next_buffer() {
+  int bytes_read = 0;
+
+  // Debug info
+  if(writing_buf_1) {
+    debugSerial.println("Streaming buffer 2...");
+  } else {
+    debugSerial.println("Streaming buffer 1...");
+  }
+
+  Serial.write(CMD_DATA_REQUEST);
+
+  // Read data from serial port
+  while(bytes_read < BLOCK_SIZE) {
+    if(Serial.available()) {
+      if(writing_buf_1) {
+        rw_buf_2[bytes_read] = Serial.read();
+      } else {
+        rw_buf_1[bytes_read] = Serial.read();
+      }
+      bytes_read++;
+      debugSerial.println(bytes_read);      
+    }
+  }
+
+  // if(Serial.readBytes(rw_buf_1, BLOCK_SIZE) < 10) {
+  //   debugSerial.println("Not received correct data");
+  //   return false;
+  // }
+
+  // // Copy into read write buffer
+  // if(writing_buf_1) {
+  //   memcpy(rw_buf_2, serial_read_buf, BLOCK_SIZE);
+  // } else {
+  //   memcpy(rw_buf_1, serial_read_buf, BLOCK_SIZE);
+  // }
+
+  return true;
+
+  // HERE DO CRC CALCULATION
+  
+}
+
 
 /******************************** COMMANDS ********************************/
 void handshake() {
-  Serial.println("AT-1.0.0");
+  Serial.write("AT-1.0.0");
   debugSerial.println("HANDSHAKE complete!");
 }
 
-////////////////////////////////////////////////////////////////////////////// TODO SOMETHING DOESN'T WORK AND IT DOESN'T READ THE LENGTH ANYMORE, BUT DOES IF I SEND IT LATER
-////// MUST BE CLEARING SERIAL BUFFER BETWEEN READ AND READBYTES
 void file_write() {
   uint32_t file_length;
 
@@ -233,20 +278,41 @@ void file_write() {
   // Populate header with correct data
   set_header(file_length);
 
-  for(int i = 0; i < 512; i++) {
-    rw_buf_1[i] = 1;
-    rw_buf_2[i] = 2;
+  // Fetch first buffer
+  if(blocks_to_write > 0) {
+    // Stream next buffer
+    if(!read_next_buffer()) {
+      blocks_to_write = 0;
+      debugSerial.println("Error streaming data!");
+      return;
+    };
+    request_new_data = false;    
   }
 
+  // Start writer interrupts
   start_data_write();
+
+  // Main read loop
+  while(blocks_to_write > 1) {
+    // Wait for write loop to need new data
+    while(!request_new_data) {};
+
+    // Read data from serial
+    if(!read_next_buffer()) {
+      blocks_to_write = 0;
+      debugSerial.println("Error streaming data!");
+      return;
+    };
+    request_new_data = false;
+  }
   
 }
 /**************************************************************************/
 
 void setup() {
-  debugSerial.begin(9600);
+  debugSerial.begin(115200);
 
-  Serial.begin(38400);
+  Serial.begin(9600);
 
   pinMode(DATA_WRITE_PIN, OUTPUT);
 

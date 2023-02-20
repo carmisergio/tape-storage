@@ -1,6 +1,8 @@
 mod args;
+mod file;
 mod serial;
 
+use file::get_blocks_from_file;
 use serial::{open_serial_connection, SerialConnectError, SerialPort};
 
 use args::{ArduTapeArgs, Command};
@@ -47,29 +49,68 @@ fn read_tape(file_path: PathBuf) {
 
 fn write_tape(serial_port: &mut Box<dyn SerialPort>, file_path: PathBuf) {
     println!("Writing {}", file_path.display());
-    send_write_command(serial_port, 1500);
+
+    let (blocks, file_length) = get_blocks_from_file(file_path).unwrap();
+
+    // println!("{:?}", blocks);
+
+    send_write_command(serial_port, file_length).expect("Unable to complete write command");
+
+    let mut block_to_write: usize = 0;
+
+    let mut read_buf: [u8; 1] = [0];
+
+    // Main write loop
+    while block_to_write < blocks.len() {
+        match serial_port.read(&mut read_buf) {
+            Ok(_) => {}
+            Err(_) => continue,
+        };
+        if read_buf[0] == b'D' {
+            println!("Sending block: {block_to_write}");
+            serial_write_block(serial_port, &blocks[block_to_write]).unwrap();
+            block_to_write = block_to_write + 1;
+        }
+    }
 }
 
-fn send_write_command(serial_port: &mut Box<dyn SerialPort>, file_length: u32) {
-    let write_buf: &mut [u8; 5] = &mut [0; 5];
-    // Set write command
-    write_buf[0] = b'W';
+fn send_write_command(serial_port: &mut Box<dyn SerialPort>, file_length: u32) -> Result<(), ()> {
+    // Send write command
+    match serial_write_u8(serial_port, b'W') {
+        Ok(_) => {}
+        Err(_) => return Err(()),
+    };
 
-    // Convert file length to bytes
-    let number_as_bytes = file_length.to_le_bytes();
+    // Send write command
+    match serial_write_u32(serial_port, file_length) {
+        Ok(_) => {}
+        Err(_) => return Err(()),
+    };
 
-    // Copy file length into write buffer
-    for i in 0..4 {
-        write_buf[i + 1] = number_as_bytes[i];
+    Ok(())
+}
+
+fn serial_write_u32(serial_port: &mut Box<dyn SerialPort>, number: u32) -> Result<(), ()> {
+    let number_as_bytes = number.to_le_bytes();
+    match serial_port.write(&number_as_bytes) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(()),
     }
+}
 
-    println!("{:?}", write_buf);
+fn serial_write_u8(serial_port: &mut Box<dyn SerialPort>, character: u8) -> Result<(), ()> {
+    let serial_buffer: [u8; 1] = [character];
+    match serial_port.write(&serial_buffer) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(()),
+    }
+}
 
-    serial_port
-        .write(write_buf)
-        .expect("Couldn't write to serial port!");
-
-    sleep(Duration::from_millis(1000));
+fn serial_write_block(serial_port: &mut Box<dyn SerialPort>, block: &[u8; 512]) -> Result<(), ()> {
+    match serial_port.write(block) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(()),
+    }
 }
 
 fn get_serial_open_error_message(err: SerialConnectError) -> &'static str {

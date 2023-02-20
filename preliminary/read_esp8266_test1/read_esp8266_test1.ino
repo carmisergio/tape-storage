@@ -44,14 +44,14 @@ ICACHE_RAM_ATTR void data_read_ISR() {
         bit_in_byte--;
         if(bit_in_byte == 0xFF) {
           
-          if(byte_read < 10)
+          if(byte_read < 16)
             Serial.print("0");
           
           Serial.print(byte_read, HEX);
           Serial.print(" ");
 
           bytes_read++;
-          if(bytes_read > 32) {
+          if(bytes_read >= 32) {
             Serial.println();
             bytes_read = 0;
           }
@@ -82,7 +82,7 @@ void loop() {
     switch(serial_in) {
       case 'r':
         Serial.println("Starging READ...");
-        start_read(Serial.parseInt());
+        start_read(Serial.parseInt()*8);
         break;
     }
   }
