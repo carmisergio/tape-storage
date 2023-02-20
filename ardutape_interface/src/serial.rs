@@ -1,4 +1,4 @@
-use serialport::SerialPort;
+pub use serialport::SerialPort;
 use std::io;
 use std::thread::sleep;
 use std::time::{Duration, Instant};

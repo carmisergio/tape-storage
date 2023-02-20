@@ -20,6 +20,10 @@ void setup() {
 
 // Data Read interrupts
 
+volatile char byte_read;
+volatile byte bit_in_byte;
+volatile byte bytes_read;
+
 ICACHE_RAM_ATTR void data_read_ISR() {
   if(digitalRead(5)) {
     if(bits_to_read > 0) {
@@ -31,11 +35,30 @@ ICACHE_RAM_ATTR void data_read_ISR() {
       } else {
         bit_end = micros();
         if(bit_fall - bit_start > bit_end - bit_fall) {
-          Serial.print("1");
+          bitSet(byte_read, bit_in_byte);
         } else {
-          Serial.print("0");
+          bitClear(byte_read, bit_in_byte);
         }
         bits_to_read--;
+        
+        bit_in_byte--;
+        if(bit_in_byte == 0xFF) {
+          
+          if(byte_read < 10)
+            Serial.print("0");
+          
+          Serial.print(byte_read, HEX);
+          Serial.print(" ");
+
+          bytes_read++;
+          if(bytes_read > 32) {
+            Serial.println();
+            bytes_read = 0;
+          }
+
+          bit_in_byte = 7;
+        }
+
         bit_start = bit_end;
       }
     }
@@ -48,6 +71,8 @@ ICACHE_RAM_ATTR void data_read_ISR() {
 void start_read(unsigned short length) {
   first_bit = true;
   bits_to_read = length;
+  bit_in_byte = 7;
+  bytes_read = 0;
 }
 
 void loop() {
@@ -57,7 +82,7 @@ void loop() {
     switch(serial_in) {
       case 'r':
         Serial.println("Starging READ...");
-        start_read(80);
+        start_read(Serial.parseInt());
         break;
     }
   }
