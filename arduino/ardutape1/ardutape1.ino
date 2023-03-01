@@ -220,7 +220,7 @@ bool read_next_buffer() {
         rw_buf_1[bytes_read] = Serial.read();
       }
       bytes_read++;
-      debugSerial.println(bytes_read);      
+      // debugSerial.println(bytes_read);      
     }
   }
 
@@ -318,7 +318,7 @@ void setup() {
 
   // Setup timer 2 to trigger interrupt at roughly 2kHz
   TCCR2A = 0b00000000; // Set clear on OCRB, set on BOTTOM
-  TCCR2B = 0b00000010; // Set clock from prescaler(256)
+  TCCR2B = 0b00000010; // Set clock from prescaler(8)
   TCNT2 = 0;           // Reset counter register
   TIMSK2 = 0b00000001; // Enable overflow interrupt
   // Setup data read interrupts
