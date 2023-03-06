@@ -2,7 +2,7 @@ mod args;
 mod file;
 mod serial;
 
-use file::get_blocks_from_file;
+use file::{get_blocks_from_file, Error};
 use serial::{open_serial_connection, SerialConnectError, SerialPort};
 
 use args::{ArduTapeArgs, Command};
@@ -48,11 +48,20 @@ fn read_tape(file_path: PathBuf) {
 }
 
 fn write_tape(serial_port: &mut Box<dyn SerialPort>, file_path: PathBuf) {
-    println!("Writing {}", file_path.display());
+    println!("Writing {}", &file_path.display());
 
-    let (blocks, file_length) = get_blocks_from_file(file_path).unwrap();
-
-    // println!("{:?}", blocks);
+    let (blocks, file_length) = match get_blocks_from_file(file_path) {
+        Ok(data) => data,
+        Err(err) => {
+            println!(
+                "{}: Couldn't read file {:?}: {}",
+                "Error".bright_red(),
+                &file_path.display(),
+                err,
+            );
+            return;
+        }
+    };
 
     send_write_command(serial_port, file_length).expect("Unable to complete write command");
 
