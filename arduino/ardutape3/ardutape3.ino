@@ -1,9 +1,13 @@
-#include <SoftwareSerial.h>
+
 
 
 // Feature enables
 //#define DEBUG
 #define EXT_TRIG
+
+#ifdef DEBUG
+#include <SoftwareSerial.h>
+#endif
 
 // Pin configuration
 #define DATA_WRITE_PIN 4
@@ -21,22 +25,25 @@
 #define BLOCK_SIZE 512
 #define HEADER_SIZE 32
 #define CRC_SIZE 2
-#define DATA_BUF_SIZE (BLOCK_SIZE + CRC_SIZE) * 2
+#define DATA_BUF_SIZE BLOCK_SIZE + CRC_SIZE
 #define HEADER_BUF_SIZE HEADER_SIZE + CRC_SIZE
 
 // Calibration config
-#define CAL_SUCCESSFUL_PULSES 20
+#define CAL_SUCCESSFUL_PULSES 550
+#define RECAL_SUCCESSFUL_PULSES 100
 #define CAL_ACCEPTED_VARIATION 0.15 // 15% accepted variation in calibration timing
 #define CAL_VALID_MAX 4000 // uS
 #define CAL_VALID_MIN 500 // uS
 #define CONTINUOUS_CAL_WEIGHT 5 // Weight of old calibration value in respect to new
+#define RECAL_TIMEOUT 1000 // ms
 
 // Tape identification string
 #define TAPE_IDENT_STR_LEN 8
-const char TAPE_IDENT_STR[]  = "VCS01SER";
+const char TAPE_IDENT_STR[]  = "VCS02SER";
 
 // Data encoding defines
-#define LEADER_LENGTH 2000
+#define LEADER_LENGTH 3000
+#define RECAL_LEADER_LENGTH 1000
 
 // Commands
 #define CMD_HANDSHAKE 'H'
@@ -57,7 +64,7 @@ SoftwareSerial DebugSerial(DEBUG_SERIAL_RX, DEBUG_SERIAL_TX);
 #endif
 
 /************************   Read functions   ************************/
-volatile int read_phase; // Read phase -> 0: not reading, 1: initial calibration, 2: leader wait, 3: header, 4: data
+volatile int read_phase; // Read phase -> 0: not reading, 1: initial calibration, 2: leader wait, 3: header, 4: intermediate calibration, 5: leader wait, 6: data
 volatile bool first_edge;
 volatile uint32_t current_time;
 volatile uint32_t last_edge_time;
@@ -65,7 +72,10 @@ volatile uint16_t current_time_delta;
 volatile uint32_t cal_sum;
 volatile int cal_count;
 volatile uint16_t cal_value;
+volatile unsigned long long calibration_start;
 volatile byte edge_count;
+
+volatile bool read_aborted;
 
 // Data read edge change interrupt
 // ICACHE_RAM_ATTR 
@@ -77,109 +87,158 @@ void read_edge_isr() {
   // Calculate time delta of current transition
   current_time_delta = current_time - last_edge_time;
 
-  // See what phase we're in
-  if(read_phase == 1) {
-    // Calibration phase
-    if(!first_edge) {
+  if(read_phase != 0) {
+    // See what phase we're in
+    if(read_phase == 1) {
+      // Calibration phase
+      if(!first_edge) {
 
-      // DebugSerial.println(current_time_delta);
+        // DebugSerial.println(current_time_delta);
 
-      if(current_time_delta <= CAL_VALID_MAX && current_time_delta >= CAL_VALID_MIN) {
-        // Serial.print(".");
-        // Serial.println(current_time_delta);
+        if(current_time_delta <= CAL_VALID_MAX && current_time_delta >= CAL_VALID_MIN) {
 
-        // Check if current time is within acceptable deviation
-        if(current_time_delta > cal_value + cal_value * CAL_ACCEPTED_VARIATION || current_time_delta < cal_value - cal_value * CAL_ACCEPTED_VARIATION) {
-          // This sequence is not the file leader
+          // Check if current time is within acceptable deviation
+          if(current_time_delta > cal_value + cal_value * CAL_ACCEPTED_VARIATION || current_time_delta < cal_value - cal_value * CAL_ACCEPTED_VARIATION) {
+            // This sequence is not the file leader
+            // Start over
+            cal_sum = 0;
+            cal_count = 0;
+          }
+
+          // Add current transition time to sum
+          cal_sum += current_time_delta;
+          cal_count++;
+
+          // Compute average
+          cal_value = cal_sum / cal_count;
+            
+          // If there were enough pulses to succesfully calibrate
+          if(cal_count >= CAL_SUCCESSFUL_PULSES) {
+            
+            // Set read phase 2 variables
+            edge_count = 0;
+            first_edge = true;
+
+            // Go to next read phase
+            read_phase = 2;
+          }
+        } else {
+          // If value was outside range of values
           // Start over
           cal_sum = 0;
           cal_count = 0;
         }
 
-        // Add current transition time to sum
-        cal_sum += current_time_delta;
-        cal_count++;
+        
 
-        // Compute average
-        cal_value = cal_sum / cal_count;
-          
-        // If there were enough pulses to succesfully calibrate
-        if(cal_count >= CAL_SUCCESSFUL_PULSES) {
-          
-          // Set read phase 2 variables
+      } else {
+        // It's not the first edge anymore
+        first_edge = false;
+      }
+
+
+    } else if(read_phase == 4) {
+      // Recalibration phase
+      if(!first_edge) {
+
+        if(current_time_delta <= CAL_VALID_MAX && current_time_delta >= CAL_VALID_MIN) {
+
+          // Check if current time is within acceptable deviation
+          if(current_time_delta > cal_value + cal_value * CAL_ACCEPTED_VARIATION || current_time_delta < cal_value - cal_value * CAL_ACCEPTED_VARIATION) {
+            // This sequence is not the file leader
+            // Start over
+            cal_sum = 0;
+            cal_count = 0;
+          }
+
+          // Add current transition time to sum
+          cal_sum += current_time_delta;
+          cal_count++;
+
+          // Compute average
+          cal_value = cal_sum / cal_count;
+            
+          // If there were enough pulses to succesfully calibrate
+          if(cal_count >= RECAL_SUCCESSFUL_PULSES) {
+            
+            // Set read phase 2 variables
+            edge_count = 0;
+            first_edge = true;
+
+            // Go to next read phase
+            read_phase = 5;
+          }
+        } else {
+          // If value was outside range of values
+          // Start over
+          cal_sum = 0;
+          cal_count = 0;
+        }
+
+        // Check if time is outside timeout  (hasn't been able to recalibrate)
+        // if(millis() - calibration_start > RECAL_TIMEOUT) {
+        //   // Communicate to main that read has been aborted
+        //   read_aborted = true;
+
+        //   // Stop read
+        //   read_phase = 0;  
+        // }
+
+        
+
+      } else {
+        // It's not the first edge anymore
+        first_edge = false;
+      }
+    } else {
+      if(!first_edge) {
+        // If we're on at least the second edge
+        if(edge_count == 0) {
+
+          // Check time with calibrated threashold value
+          if(current_time_delta > ((cal_value * 13) / 20)) {
+
+            // Received bit 1
+            process_bit(1);
+
+            // Add data point to continuous calibration
+            // continuous_cal(current_time_delta);
+
+          } else {
+
+            // Received bit 0
+            process_bit(0);  
+
+            // Add data point to continuous calibration
+            // continuous_cal(current_time_delta << 1); // Transition for a zero is half
+
+            // Keep track of edge
+            edge_count++;    
+          }
+        }
+        else if(edge_count == 1) {
+          // Second edge of 0 bit: reset to first edge
           edge_count = 0;
-          first_edge = true;
-
-          // Go to next read phase
-          read_phase = 2;
-
-          // DebugSerial.println();
-          // DebugSerial.print("Cal success! Value: ");
-          // DebugSerial.println(cal_value);
-          // DebugSerial.println("Waiting for first start bit...");
         }
       } else {
-        // If value was outside range of values
-        // Start over
-        cal_sum = 0;
-        cal_count = 0;
+        first_edge = false;
       }
-
-      
-
-    } else {
-      // It's not the first edge anymore
-      first_edge = false;
     }
   }
 
-  if(read_phase > 1) {
 
-    if(!first_edge) {
-      // If we're on at least the second edge
-      if(edge_count == 0) {
-
-        // Check time with calibrated threashold value
-        if(current_time_delta > ((cal_value * 3) / 4)) {
-
-          // Received bit 1
-          process_bit(1);
-
-          // Add data point to continuous calibration
-          continuous_cal(current_time_delta);
-
-        } else {
-
-          // Received bit 0
-          process_bit(0);  
-
-          // Add data point to continuous calibration
-          continuous_cal(current_time_delta << 1); // Transition for a zero is half
-
-          // Keep track of edge
-          edge_count++;    
-        }
-      }
-      else if(edge_count == 1) {
-        // Second edge of 0 bit: reset to first edge
-        edge_count = 0;
-      }
-    } else {
-      first_edge = false;
-    }
-  }
 
   // Save time;
   last_edge_time = current_time;
 }
 
-uint16_t average_sum;
-void continuous_cal(uint16_t new_value) {
-  average_sum = cal_value * CONTINUOUS_CAL_WEIGHT;
-  // // average_sum = average_sum * CONTINUOUS_; // Multiply by 16
-  average_sum += new_value;
-  cal_value = average_sum / (CONTINUOUS_CAL_WEIGHT + 1);
-}
+// uint16_t average_sum;
+// void continuous_cal(uint16_t new_value) {
+//   average_sum = cal_value * CONTINUOUS_CAL_WEIGHT;
+//   // // average_sum = average_sum * CONTINUOUS_; // Multiply by 16
+//   average_sum += new_value;
+//   cal_value = average_sum / (CONTINUOUS_CAL_WEIGHT + 1);
+// }
 
 // Read setup variables
 volatile uint32_t read_setup_blocks;
@@ -187,13 +246,13 @@ volatile uint32_t read_setup_blocks;
 // Communication variables with main loop
 volatile uint32_t read_file_length;
 volatile bool header_read;
-volatile bool read_aborted;
-volatile int read_data_available; // 0 -> No data available, 1 -> Left part of the buffer available, 2 -> Right part of the buffer available
+volatile bool read_data_available; // 0 -> No data available, 1 -> Left part of the buffer available, 2 -> Right part of the buffer available
 
 volatile int bit_counter;
 volatile byte byte_read;
 volatile int byte_counter;
 volatile uint32_t bytes_read;
+volatile uint32_t blocks_read;
 void process_bit(bool bit_value) {
   if(read_phase == 2) {
     // Waiting for first start bit
@@ -204,11 +263,25 @@ void process_bit(bool bit_value) {
       bytes_read = 0;
 
       // Go to next read phase
-      read_phase = 3;
+      read_phase = 3; // Header read
     }
   }
 
-  if(read_phase == 3 || read_phase == 4) {
+  if(read_phase == 5) {
+    // Waiting for first start bit
+    if(bit_value == 0) {
+
+      bytes_read = 0;
+      byte_counter = 0;
+      blocks_read = 0;
+      
+
+      // Go to next read phase
+      read_phase = 6;
+    }
+  }
+
+  if(read_phase == 3 || read_phase == 6) {
     // Actual bytes are read here
 
     // Detect framing errors
@@ -236,19 +309,11 @@ void process_bit(bool bit_value) {
   }
 }
 
-volatile uint32_t blocks_read;
 void process_byte(byte byte_value) {
   
   if(read_phase == 3) {
     // Header read
     
-    // // Print bytes to serial
-    // if(byte_value <= 0xF) {
-    //   Serial.print('0');
-    // }
-    // Serial.print(byte_value, HEX);
-    // Serial.print(" ");
-
     // If this is the last byte of the header
     if(bytes_read == HEADER_BUF_SIZE - 1) {
       // Reset bytes read
@@ -258,9 +323,15 @@ void process_byte(byte byte_value) {
 
       // Extract information from header
       setup_read_from_header();
+
+
+      first_edge = true;
+      cal_sum = 0;
+      cal_count = 0;
+      calibration_start = millis();
             
       // Switch to read phase 4
-      read_phase = 4;
+      read_phase = 4; // Internal calibration
 
       return;
     }
@@ -271,53 +342,14 @@ void process_byte(byte byte_value) {
     bytes_read++;
   }
 
-  if(read_phase == 4) {
+  if(read_phase == 6) {
     // Data read
-    
-    // // Print bytes to serial
-    // if(byte_value <= 0xF) {
-    //   Serial.print('0');
-    // }
-    // Serial.print(byte_value, HEX);
-    // Serial.print(" ");
-    
-    // if(byte_counter >= 31) {
-    //   Serial.println();
-    //   byte_counter = 0;
-    // } else {
-    //   byte_counter++;
-    // }
 
     // Save value in data buffer
     data_buf[bytes_read] = byte_value;
-
-    // If we're at the middle of the data buffer (first block read)
-    if(bytes_read == BLOCK_SIZE + CRC_SIZE - 1) {
-      // Serial.println();
-      // Serial.println();
-      byte_counter = 0;
-
-      // Next block
-      blocks_read++;
-
-      // Notify main loop that there is data available
-      read_data_available = 1; // Left part of buffer available
-
-      // Check if we've read all blocks
-      if(blocks_read >= read_setup_blocks) {
-        // Read DONE!
-
-        // Serial.println("Done!");
-
-        // Stop reading further data
-        read_phase = 0;
-      }
-    }
     
     // If we're at the end of the data buffer
     if(bytes_read == DATA_BUF_SIZE - 1) {
-      // Serial.println();
-      // Serial.println();
       byte_counter = 0;
       // Reset bytes read
       bytes_read = 0;
@@ -326,7 +358,7 @@ void process_byte(byte byte_value) {
       blocks_read++;
 
       // Notify main loop that there is data available
-      read_data_available = 2; // Right part of buffer available
+      read_data_available = true;
 
       // Check if we've read all blocks
       if(blocks_read >= read_setup_blocks) {
@@ -336,7 +368,16 @@ void process_byte(byte byte_value) {
 
         // Stop reading further data
         read_phase = 0;
+        return;
       }
+
+      first_edge = true;
+      cal_sum = 0;
+      cal_count = 0;
+      calibration_start = millis();
+
+      // Go to recalibration
+      read_phase = 4;
 
     } else {
       // Go to next byte
@@ -397,7 +438,7 @@ void start_read() {
   // Make main loop wait for calibration and header
   header_read = false;
   read_aborted = false;
-  read_data_available = 0;
+  read_data_available = false;
 
   #ifdef DEBUG
   DebugSerial.println("Waiting for cal...");
@@ -414,16 +455,11 @@ volatile uint32_t write_setup_blocks;
 
 volatile bool bit_start;
 volatile bool current_bit;
-volatile int write_phase; // Write phase -> 0: not writing, 1: leader, 2: header, 3: data
+volatile int write_phase; // Write phase -> 0: not writing, 1: leader, 2: header, 3: recal leader, 4: data
 volatile bool write_pin_state;
 
-volatile byte tick_count = 0;
 ISR(TIMER2_OVF_vect) {
-  // Only run write tick every 2 interrupts
-  if(++tick_count == 1) {
-    write_tick();
-    tick_count = 0;
-  }
+  write_tick();
 }
 
 void write_tick() {
@@ -465,7 +501,6 @@ volatile uint32_t blocks_written;
 volatile uint32_t bytes_written;
 volatile byte bit_in_byte;
 volatile byte current_byte;
-volatile int buffer_lock; // true -> left part locked, false -> right part locked
 volatile bool request_fill;
 volatile bool write_done;
 
@@ -522,11 +557,9 @@ bool get_bit() {
         // Header finished
         // Switch to data write phase
 
-        // Set variables for data write
+        // Set variables for recal leader write
         blocks_written = 0;
-        bytes_written = 0;
-        bit_in_byte = 0xFF;
-        buffer_lock = true; // Lock left part of buffer
+        leader_counter = 0; // Set leader counter
         request_fill = true;
 
         // Set write phase
@@ -553,8 +586,28 @@ bool get_bit() {
       }
     }
   }
+
+  if(write_phase == 3) {
+    // We are in the recal leader write phase
+    
+    // Check if we are stil in the leader
+    if(leader_counter < RECAL_LEADER_LENGTH) {
+      leader_counter++;
+      return true; // Bits are all 1 in header
+    } else {
+      // Leader finished
+      // Switch to header write phase
+      
+      // Set variables for data write
+      bytes_written = 0;
+      bit_in_byte = 0xFF;
+
+      // Set write phase
+      write_phase = 4;
+    }
+  }
   
-  if (write_phase == 3) {
+  if (write_phase == 4) {
     // We are in the data write phase
 
     // Check that we aren't outside the byte
@@ -563,32 +616,19 @@ bool get_bit() {
       
       // Need new byte
 
-      // Check if we are at the middle of the buffer (going into the next block)
-      if(bytes_written == BLOCK_SIZE + CRC_SIZE) {
-        
-        // Count block
-        blocks_written++;
-        
-        // Request fill of left part of buffer
-        buffer_lock = false;
-        request_fill = true;
-      }
-
       // Check if there are still bytes to write
       if(bytes_written >= DATA_BUF_SIZE) {
         // End of data buffer
         // Go back to beginning of buffer
 
-        // Reset variables
-        bytes_written = 0;
-        bit_in_byte = 8;
-
         // Count block
         blocks_written++;
 
-        // Request fill of left part of buffer
-        buffer_lock = true;
+        // Go back to recal leader write
+        leader_counter = 0; // Set leader counter
         request_fill = true;
+        write_phase = 3;
+        return 1; // Write 1
       }
 
       // Check if there are still blocks to write
@@ -610,7 +650,7 @@ bool get_bit() {
     }
 
     // Check that we are still in the data write phase
-    if(write_phase == 3) {
+    if(write_phase == 4) {
       // Check if this is the start bit
       if(bit_in_byte == 8) {
 
@@ -641,9 +681,6 @@ void start_write() {
 
     // Set leader counter
     leader_counter = 0;
-
-    // Lock right part of buffer (so first fill from serial will fill left part)
-    buffer_lock = false;
 
     // Do not request data
     request_fill = false;
@@ -690,7 +727,7 @@ void setup_header_buf(uint32_t file_size) {
 /****************** Serial communication functions *******************/
 int update_block_in_buffer() {
   // Compute starting offset into buffer depending on which part is free
-  int offset = buffer_lock ? BLOCK_SIZE + CRC_SIZE : 0;
+  // int offset = buffer_lock ? BLOCK_SIZE + CRC_SIZE : 0;
   int bytes_read = 0;
   unsigned long last_byte_time;
 
@@ -711,7 +748,7 @@ int update_block_in_buffer() {
     }
 
     if(Serial.available()) {
-      data_buf[offset + bytes_read] = Serial.read();
+      data_buf[bytes_read] = Serial.read();
       bytes_read++;
       last_byte_time = millis();
     }
@@ -741,10 +778,8 @@ void write_uint32_t_to_serial(uint32_t &number) {
 
 /************************** CRC functions ****************************/
 void calc_crc() {
-  // Compute starting offset into buffer depending on which part is free
-  int offset = buffer_lock ? 2 * BLOCK_SIZE + CRC_SIZE : BLOCK_SIZE; 
-  data_buf[offset] = 1;
-  data_buf[offset + 1] = 2;
+  data_buf[512] = 1;
+  data_buf[513] = 2;
 }
 /*********************************************************************/
 
@@ -792,7 +827,7 @@ void file_read() {
   while(blocks_read_local < blocks_to_read) {
     
     // Wait for either data or read abort
-    while(read_data_available == 0 && !read_aborted);
+    while(!read_data_available && !read_aborted);
 
     // If aborted, exit read
     if(read_aborted) {
@@ -805,13 +840,11 @@ void file_read() {
     DebugSerial.println(read_data_available);
     #endif
 
-    buffer_offset = read_data_available == 1 ? 0 : BLOCK_SIZE + CRC_SIZE;
-
-    read_data_available = 0;   
+    read_data_available = false;   
 
     // Send data over serial
     Serial.write(CMD_DATA_REQUEST); // Notify PC of data available
-    Serial.write((byte *)data_buf + buffer_offset, BLOCK_SIZE);
+    Serial.write((byte *)data_buf, BLOCK_SIZE);
 
     blocks_read_local++; 
   }
@@ -862,19 +895,19 @@ void file_write() {
   setup_header_buf(file_length);
 
   // Get first block into the buffer
-  if(update_block_in_buffer() != 0) { 
-    abort_write();
-    return;    
-  } 
+  // if(update_block_in_buffer() != 0) { 
+  //   abort_write();
+  //   return;    
+  // } 
 
-  calc_crc();
+  // calc_crc();
 
   // Start write
   write_setup_blocks = blocks;
   start_write();
 
   // Start checking if new data is needed
-  for(int i = 1; i < blocks; i++) {
+  for(int i = 0; i < blocks; i++) {
     // Wait for data to be requested by write routine
     while(!request_fill);
 

@@ -1,7 +1,7 @@
 #define DEBUG
 
 // Pin configuration
-#define DATA_WRITE_PIN 13
+#define DATA_WRITE_PIN 4
 #define EXT_TRIGGER_PIN 12
 
 // Buffer sizes
@@ -301,7 +301,7 @@ void test_write() {
   int blocks = 20;
   int block_counter;
 
-  setup_header_buf(0b11111111000000001010101011111111);
+  setup_header_buf(10240);
   
   current_value = 1;
   update_block_in_buffer(); // Get first block into the buffer
