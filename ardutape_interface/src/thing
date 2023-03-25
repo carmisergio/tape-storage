@@ -1,0 +1,3 @@
+
+const HEADER_TIME: Duration = Duration::from_millis(2083); // mS
+const BLOCK_TIME: Duration = Duration::from_millis(6212); // mS

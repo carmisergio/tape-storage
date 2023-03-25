@@ -11,3 +11,4 @@ authors = ["Sergio Carmine 3CITI <me@sergiocarmi.net>"]
 clap = { version = "4.1.4", features = ["derive"] }
 serialport = "4.2.0"
 colored = "2.0.0"
+indicatif = "0.17.3"

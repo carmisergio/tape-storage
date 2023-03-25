@@ -1,13 +1,5 @@
-
-
-
 // Feature enables
-//#define DEBUG
 #define EXT_TRIG
-
-#ifdef DEBUG
-#include <SoftwareSerial.h>
-#endif
 
 // Pin configuration
 #define DATA_WRITE_PIN 4
@@ -32,9 +24,12 @@
 #define CAL_SUCCESSFUL_PULSES 550
 #define RECAL_SUCCESSFUL_PULSES 100
 #define CAL_ACCEPTED_VARIATION 0.15 // 15% accepted variation in calibration timing
-#define CAL_VALID_MAX 4000 // uS
+#define CAL_VALID_MAX 2000 // uS
 #define CAL_VALID_MIN 500 // uS
-#define CONTINUOUS_CAL_WEIGHT 5 // Weight of old calibration value in respect to new
+
+// Abort config
+#define READ_VALID_MIN 100 // uS
+#define READ_VALID_MAX 2000 // uS
 #define RECAL_TIMEOUT 1000 // ms
 
 // Tape identification string
@@ -53,21 +48,18 @@ const char TAPE_IDENT_STR[]  = "VCS02SER";
 #define CMD_ABORT 'A'
 #define CMD_SUCCESS 'S'
 #define CMD_BEGIN 'B'
+#define CMD_METADATA 'M'
 
 // Data buffers
 volatile byte header_buf[HEADER_BUF_SIZE];
 volatile byte data_buf[DATA_BUF_SIZE]; 
-
-// Software serial for debug
-#ifdef DEBUG
-SoftwareSerial DebugSerial(DEBUG_SERIAL_RX, DEBUG_SERIAL_TX);
-#endif
 
 /************************   Read functions   ************************/
 volatile int read_phase; // Read phase -> 0: not reading, 1: initial calibration, 2: leader wait, 3: header, 4: intermediate calibration, 5: leader wait, 6: data
 volatile bool first_edge;
 volatile uint32_t current_time;
 volatile uint32_t last_edge_time;
+volatile uint32_t last_edge_time_timeout;
 volatile uint16_t current_time_delta;
 volatile uint32_t cal_sum;
 volatile int cal_count;
@@ -75,10 +67,12 @@ volatile uint16_t cal_value;
 volatile unsigned long long calibration_start;
 volatile byte edge_count;
 
+volatile uint32_t counter = 0;
+
 volatile bool read_aborted;
+volatile bool calibrated;
 
 // Data read edge change interrupt
-// ICACHE_RAM_ATTR 
 void read_edge_isr() {
 
   // Get time of current edge
@@ -93,8 +87,7 @@ void read_edge_isr() {
       // Calibration phase
       if(!first_edge) {
 
-        // DebugSerial.println(current_time_delta);
-
+        // Check if current time is within acceptable range
         if(current_time_delta <= CAL_VALID_MAX && current_time_delta >= CAL_VALID_MIN) {
 
           // Check if current time is within acceptable deviation
@@ -119,6 +112,9 @@ void read_edge_isr() {
             edge_count = 0;
             first_edge = true;
 
+            // Tell main loop we've calibrated
+            calibrated = true;
+
             // Go to next read phase
             read_phase = 2;
           }
@@ -141,6 +137,7 @@ void read_edge_isr() {
       // Recalibration phase
       if(!first_edge) {
 
+        // Check if current time is within acceptable range
         if(current_time_delta <= CAL_VALID_MAX && current_time_delta >= CAL_VALID_MIN) {
 
           // Check if current time is within acceptable deviation
@@ -174,18 +171,6 @@ void read_edge_isr() {
           cal_sum = 0;
           cal_count = 0;
         }
-
-        // Check if time is outside timeout  (hasn't been able to recalibrate)
-        // if(millis() - calibration_start > RECAL_TIMEOUT) {
-        //   // Communicate to main that read has been aborted
-        //   read_aborted = true;
-
-        //   // Stop read
-        //   read_phase = 0;  
-        // }
-
-        
-
       } else {
         // It's not the first edge anymore
         first_edge = false;
@@ -195,22 +180,26 @@ void read_edge_isr() {
         // If we're on at least the second edge
         if(edge_count == 0) {
 
+          // Check if time was too short
+          if(current_time_delta < READ_VALID_MIN) {
+
+            // Tell main loop we've aborted
+            read_aborted = true;
+
+            // Stop read
+            read_phase = 0;
+          }
+
           // Check time with calibrated threashold value
           if(current_time_delta > ((cal_value * 13) / 20)) {
 
             // Received bit 1
             process_bit(1);
 
-            // Add data point to continuous calibration
-            // continuous_cal(current_time_delta);
-
           } else {
 
             // Received bit 0
             process_bit(0);  
-
-            // Add data point to continuous calibration
-            // continuous_cal(current_time_delta << 1); // Transition for a zero is half
 
             // Keep track of edge
             edge_count++;    
@@ -223,6 +212,7 @@ void read_edge_isr() {
       } else {
         first_edge = false;
       }
+      counter++;
     }
   }
 
@@ -232,21 +222,13 @@ void read_edge_isr() {
   last_edge_time = current_time;
 }
 
-// uint16_t average_sum;
-// void continuous_cal(uint16_t new_value) {
-//   average_sum = cal_value * CONTINUOUS_CAL_WEIGHT;
-//   // // average_sum = average_sum * CONTINUOUS_; // Multiply by 16
-//   average_sum += new_value;
-//   cal_value = average_sum / (CONTINUOUS_CAL_WEIGHT + 1);
-// }
-
 // Read setup variables
 volatile uint32_t read_setup_blocks;
 
 // Communication variables with main loop
 volatile uint32_t read_file_length;
 volatile bool header_read;
-volatile bool read_data_available; // 0 -> No data available, 1 -> Left part of the buffer available, 2 -> Right part of the buffer available
+volatile bool read_data_available;
 
 volatile int bit_counter;
 volatile byte byte_read;
@@ -364,8 +346,6 @@ void process_byte(byte byte_value) {
       if(blocks_read >= read_setup_blocks) {
         // Read DONE!
 
-        // Serial.println("Done!");
-
         // Stop reading further data
         read_phase = 0;
         return;
@@ -387,11 +367,38 @@ void process_byte(byte byte_value) {
 
 }
 
+// Function to be called at regular interval to check timeouts
+// void check_timeouts() {
+
+//   // In the internal calibration phase
+//   if(read_phase == 4) {
+//     // Check if time is outside timeout  (hasn't been able to recalibrate)
+//     if(millis() - calibration_start > RECAL_TIMEOUT) {
+//       // Communicate to main that read has been aborted
+//       read_aborted = true;
+
+//       // Stop read
+//       read_phase = 0;  
+//     }
+//   }
+
+//   // This was supposed to timeout the single data pulses
+//   // In one of the actual byte reading phases
+//   if(read_phase == 2 || read_phase == 3 || read_phase == 5 || read_phase == 6) {
+//     if((micros() - last_edge_time) > READ_VALID_MAX && !first_edge) {
+//       // Tell main loop we've aborted
+//       read_aborted = true;
+
+//       Serial.write("2");
+//       Serial.println(counter);
+
+//       // Stop read
+//       read_phase = 0;
+//     }
+//   }  
+// }
+
 void framing_error() {
-  #ifdef DEBUG
-  DebugSerial.println("Framing error! Aborting read...");
-  #endif
-  
   // Inform main loop
   read_aborted = true;
 
@@ -413,9 +420,7 @@ void setup_read_from_header() {
       read_setup_blocks = 1 + ((read_file_length - 1) / BLOCK_SIZE); // if x != 0
 
   } else {
-    #ifdef DEBUG
-    DebugSerial.println("Tape ident doesn't match!");
-    #endif
+    // Tape ident doesn't match
 
     read_aborted = true;
     read_phase = 0;
@@ -437,12 +442,9 @@ void start_read() {
 
   // Make main loop wait for calibration and header
   header_read = false;
+  calibrated = false;
   read_aborted = false;
   read_data_available = false;
-
-  #ifdef DEBUG
-  DebugSerial.println("Waiting for cal...");
-  #endif
 
   // Set reader to initial calibration phase
   read_phase = 1; 
@@ -463,11 +465,6 @@ ISR(TIMER2_OVF_vect) {
 }
 
 void write_tick() {
-  #ifdef EXT_TRIG
-  // Reset external trigger for oscilloscope
-  digitalWrite(EXT_TRIGGER_PIN, LOW);
-  #endif
-
   // Check if we are supposed to be still writing
   if (write_phase != 0) {
     // Check if first edge of bit
@@ -475,10 +472,6 @@ void write_tick() {
       // Get new bit
       current_bit = get_bit();
       
-      #ifdef DEBUG
-      DebugSerial.print(current_bit);
-      #endif
-
       // On first edge, always invert
       toggle_write_pin();
     } else {
@@ -548,10 +541,6 @@ bool get_bit() {
         current_byte = header_buf[bytes_written];
         // Next byte
         bytes_written++;
-
-        #ifdef DEBUG
-        DebugSerial.println();
-        #endif
 
       } else {
         // Header finished
@@ -644,20 +633,12 @@ bool get_bit() {
       // Next byte
       bytes_written++;
 
-      #ifdef DEBUG
-      DebugSerial.println();
-      #endif
     }
 
     // Check that we are still in the data write phase
     if(write_phase == 4) {
       // Check if this is the start bit
       if(bit_in_byte == 8) {
-
-        #ifdef EXT_TRIG
-        // Send external trigger pulse
-        digitalWrite(EXT_TRIGGER_PIN, HIGH);
-        #endif
 
         return false; // Start bit is always 0;
       } else if (bit_in_byte == 0xFF) {
@@ -693,7 +674,8 @@ void start_write() {
     bit_start = true;
 
   } else {
-    Serial.println("Error starting write: write already in progress!");
+    // Alread writing
+    Serial.write(CMD_ABORT);
   }  
 }
 
@@ -702,10 +684,6 @@ void abort_write() {
   // Communciate to PC that the write was aborted
   Serial.write(CMD_ABORT);
 
-  #ifdef DEBUG
-  DebugSerial.println("Write aborted!");
-  #endif
-  
   // Stop write
   write_phase = 0;
 }
@@ -726,8 +704,6 @@ void setup_header_buf(uint32_t file_size) {
 
 /****************** Serial communication functions *******************/
 int update_block_in_buffer() {
-  // Compute starting offset into buffer depending on which part is free
-  // int offset = buffer_lock ? BLOCK_SIZE + CRC_SIZE : 0;
   int bytes_read = 0;
   unsigned long last_byte_time;
 
@@ -740,9 +716,6 @@ int update_block_in_buffer() {
 
     // Check for read timeout
     if(millis() - last_byte_time > BLOCK_READ_BYTE_TIMEOUT) {
-      #ifdef DEBUG
-      DebugSerial.println("Serial byte read timeout error!");
-      #endif
       return 1;
       
     }
@@ -778,6 +751,7 @@ void write_uint32_t_to_serial(uint32_t &number) {
 
 /************************** CRC functions ****************************/
 void calc_crc() {
+  // Arbitrary data in place of crc
   data_buf[512] = 1;
   data_buf[513] = 2;
 }
@@ -786,10 +760,6 @@ void calc_crc() {
 /******************************** COMMANDS ********************************/
 void handshake() {
   Serial.write("AT-1.0.0");
-
-  #ifdef DEBUG
-  DebugSerial.println("HANDSHAKE complete!");
-  #endif
 }
 
 void file_read() {
@@ -801,8 +771,16 @@ void file_read() {
   // Begin listening for calibration leader
   start_read();
 
+  // Wait for calibration
+  while(!calibrated);
+
+  Serial.write(CMD_BEGIN);
+
   // Wait for header read to be done
-  while(!header_read && !read_aborted);
+  while(!header_read && !read_aborted) {
+    // Check read for timeouts
+    // check_timeouts();
+  };
 
   if(read_aborted) {
     Serial.write(CMD_ABORT);
@@ -813,13 +791,8 @@ void file_read() {
   file_length = read_file_length;
   blocks_to_read = read_setup_blocks;
 
-  #ifdef DEBUG
-  DebugSerial.println("Blocks to read: ");
-  DebugSerial.println(blocks_to_read);
-  #endif
-
   // Communicate file length to PC
-  Serial.write(CMD_BEGIN);
+  Serial.write(CMD_METADATA);
   write_uint32_t_to_serial(file_length);
 
   // Main read loop
@@ -827,19 +800,16 @@ void file_read() {
   while(blocks_read_local < blocks_to_read) {
     
     // Wait for either data or read abort
-    while(!read_data_available && !read_aborted);
+    while(!read_data_available && !read_aborted) {
+      // Check read for timeouts
+      // check_timeouts();
+    };
 
     // If aborted, exit read
     if(read_aborted) {
       Serial.write(CMD_ABORT);
       return;
     }
-
-    #ifdef DEBUG
-    DebugSerial.println("rda: ");
-    DebugSerial.println(read_data_available);
-    #endif
-
     read_data_available = false;   
 
     // Send data over serial
@@ -855,24 +825,12 @@ void file_write() {
   uint32_t blocks;
   uint32_t blocks_written;
 
-  #ifdef DEBUG
-  DebugSerial.println("Start file WRITE!");
-  #endif
-
   // Read file length from serial
   if(read_uint32_t_from_serial(file_length) != 0) {
-
-    #ifdef DEBUG
-    DebugSerial.println("Exiting from file write");
-    #endif
-
+    // Error reading file length
+    Serial.write(CMD_ABORT);
     return;
   }
-
-  #ifdef DEBUG
-  DebugSerial.print("File length: ");
-  DebugSerial.println(file_length);
-  #endif
 
   // Compute file size in blocks
   if(file_length == 0)
@@ -880,27 +838,10 @@ void file_write() {
   else
     blocks = 1 + ((file_length - 1) / BLOCK_SIZE); // if x != 0
 
-  #ifdef DEBUG
-  DebugSerial.print("Blocks: ");
-  DebugSerial.println(blocks);
-  #endif
-
-  delay(500);
-
-  #ifdef DEBUG
-  DebugSerial.println("Starting write...");
-  #endif
+  // delay(500);
 
   // Populate header with correct data
   setup_header_buf(file_length);
-
-  // Get first block into the buffer
-  // if(update_block_in_buffer() != 0) { 
-  //   abort_write();
-  //   return;    
-  // } 
-
-  // calc_crc();
 
   // Start write
   write_setup_blocks = blocks;
@@ -921,25 +862,17 @@ void file_write() {
     request_fill = false;
   }
 
+  // Wait for write to be done
   while(!write_done);
 
   // Alert PC of write done
   Serial.write(CMD_SUCCESS);
-
-  #ifdef DEBUG
-  DebugSerial.println("Write done!");
-  #endif
 }
 /**************************************************************************/
 
 void setup() {
   // Setup serial communication
   Serial.begin(MAIN_SERIAL_SPEED);
-
-  #ifdef DEBUG 
-  DebugSerial.begin(DEBUG_SERIAL_SPEED);
-  #endif
-  
 
   // Setup pins
   pinMode(DATA_WRITE_PIN, OUTPUT);
@@ -956,13 +889,10 @@ void setup() {
 
   // Setup read edge change interrupt
   attachInterrupt(digitalPinToInterrupt(DATA_READ_PIN), read_edge_isr, CHANGE);
-
-  #ifdef DEBUG
-  DebugSerial.println("READY!");
-  #endif
 }
 
 void loop() {
+  // Read initial commands
   if(Serial.available() > 0) {
 
     switch(Serial.read()) {
